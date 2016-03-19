@@ -45,6 +45,18 @@
 #define SMB_MASK(LEFT_BIT_POS, RIGHT_BIT_POS) \
 		_SMB_MASK((LEFT_BIT_POS) - (RIGHT_BIT_POS) + 1, \
 				(RIGHT_BIT_POS))
+
+#ifdef CONFIG_CHARGE_LEVEL
+#include "linux/charge_level.h"
+int ac_level = AC_CHARGE_LEVEL_DEFAULT;    // Set AC default charge level
+int usb_level  = USB_CHARGE_LEVEL_DEFAULT; // Set USB default charge level
+int charge_info_level_req = 0;	// requested charge current
+int charge_info_level_cur = 0;	// current charge current
+int charge_level = 0;			// 0 = stock charge logic, not 0 = current to set
+static bool set_by_charge_level = false;	// flag for detection of set values
+char charge_info_text[30] = "No charger";
+#endif /* CONFIG_CHARGE_LEVEL */
+
 /* Config registers */
 struct smbchg_regulator {
 	struct regulator_desc	rdesc;
@@ -1342,7 +1354,7 @@ static int smbchg_set_high_usb_chg_current(struct smbchg_chip *chip,
 static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 							int current_ma)
 {
-	int rc = 0;
+	int rc;
 	bool changed;
 
 	if (!chip->batt_present) {
@@ -1376,6 +1388,7 @@ static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 					USBIN_MODE_CHG_BIT | USB51_MODE_BIT,
 					USBIN_LIMITED_MODE | USB51_100MA);
 		chip->usb_max_current_ma = 100;
+		goto out;
 	}
 	/* specific current values */
 	if (current_ma == CURRENT_150_MA) {
@@ -1386,6 +1399,7 @@ static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 					USBIN_MODE_CHG_BIT | USB51_MODE_BIT,
 					USBIN_LIMITED_MODE | USB51_100MA);
 		chip->usb_max_current_ma = 150;
+		goto out;
 	}
 	if (current_ma == CURRENT_500_MA) {
 		rc = smbchg_sec_masked_write(chip,
@@ -1395,6 +1409,7 @@ static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 					USBIN_MODE_CHG_BIT | USB51_MODE_BIT,
 					USBIN_LIMITED_MODE | USB51_500MA);
 		chip->usb_max_current_ma = 500;
+		goto out;
 	}
 	if (current_ma == CURRENT_900_MA) {
 		rc = smbchg_sec_masked_write(chip,
@@ -1404,15 +1419,19 @@ static int smbchg_set_usb_current_max(struct smbchg_chip *chip,
 					USBIN_MODE_CHG_BIT | USB51_MODE_BIT,
 					USBIN_LIMITED_MODE | USB51_500MA);
 		chip->usb_max_current_ma = 900;
+		goto out;
 	}
 
+out:
 	rc = smbchg_set_high_usb_chg_current(chip, current_ma);
+	pr_smb(PR_STATUS, "usb current set to %d mA\n",
+			chip->usb_max_current_ma);
+#ifdef CONFIG_CHARGE_LEVEL
+	charge_info_level_req = chip->usb_max_current_ma;
+#endif /* CONFIG_CHARGE_LEVEL */
 	if (rc < 0)
 		dev_err(chip->dev,
 			"Couldn't set %dmA rc = %d\n", current_ma, rc);
-out:
-	pr_smb(PR_STATUS, "usb current set to %d mA\n",
-			chip->usb_max_current_ma);
 	return rc;
 }
 
@@ -2285,8 +2304,18 @@ static int smbchg_set_thermal_limited_usb_current_max(struct smbchg_chip *chip,
 		return rc;
 	}
 
+#ifdef CONFIG_CHARGE_LEVEL
+	if (set_by_charge_level) {
+		pr_err("AICL = %d, ICL = %d requested by charge level interface\n",
+				aicl_ma, chip->usb_max_current_ma);
+		set_by_charge_level = false;
+	} else {
+#endif /* CONFIG_CHARGE_LEVEL */
 	pr_smb(PR_STATUS, "AICL = %d, ICL = %d\n",
 			aicl_ma, chip->usb_max_current_ma);
+#ifdef CONFIG_CHARGE_LEVEL
+	}
+#endif /* CONFIG_CHARGE_LEVEL */
 	if (chip->usb_max_current_ma > aicl_ma && smbchg_is_aicl_complete(chip))
 		smbchg_rerun_aicl(chip);
 	smbchg_parallel_usb_check_ok(chip);
@@ -4141,6 +4170,23 @@ static void handle_usb_insertion(struct smbchg_chip *chip)
 	pr_smb(PR_STATUS,
 		"inserted type = %d (%s)", usb_supply_type, usb_type_name);
 
+#ifdef CONFIG_CHARGE_LEVEL
+	if (usb_supply_type == POWER_SUPPLY_TYPE_USB_DCP)
+	{
+	    charge_level = ac_level;
+	    sprintf(charge_info_text, "AC charger");
+	}
+	else if (usb_supply_type == POWER_SUPPLY_TYPE_USB)
+	{
+	    charge_level = usb_level;
+	    sprintf(charge_info_text, "USB charger");
+	}
+	else
+	{
+	    charge_level = 0; // enable stock charging logic
+	    sprintf(charge_info_text, "Unknown charger %d", usb_supply_type);
+	}
+#endif /* CONFIG_CHARGE_LEVEL */
 	smbchg_aicl_deglitch_wa_check(chip);
 	if (chip->usb_psy) {
 		pr_smb(PR_MISC, "setting usb psy type = %d\n",
@@ -4201,6 +4247,12 @@ void update_usb_status(struct smbchg_chip *chip, bool usb_present, bool force)
 	} else if (chip->usb_present && !usb_present) {
 		chip->usb_present = usb_present;
 		handle_usb_removal(chip);
+#ifdef CONFIG_CHARGE_LEVEL
+		charge_level = 0;
+		charge_info_level_req = 0;
+		charge_info_level_cur = 0;
+		sprintf(charge_info_text, "No charger");
+#endif /* CONFIG_CHARGE_LEVEL */
 	}
 unlock:
 	mutex_unlock(&chip->usb_status_lock);
